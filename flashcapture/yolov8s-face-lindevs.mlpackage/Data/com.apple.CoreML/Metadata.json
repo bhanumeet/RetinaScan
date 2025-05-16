@@ -1,0 +1,18 @@
+{
+  "MLModelVersionStringKey" : "8.3.98",
+  "MLModelDescriptionKey" : "Ultralytics YOLOv8s-face-lindevs model trained on train\/data\/widerface.yaml",
+  "MLModelCreatorDefinedKey" : {
+    "stride" : "32",
+    "Confidence threshold" : "0.25",
+    "IoU threshold" : "0.7",
+    "docs" : "https:\/\/docs.ultralytics.com",
+    "task" : "detect",
+    "imgsz" : "[640, 640]",
+    "date" : "2025-05-12T15:01:43.469251",
+    "batch" : "1",
+    "args" : "{'batch': 1, 'half': False, 'int8': False, 'nms': True}",
+    "names" : "{0: 'face'}"
+  },
+  "MLModelAuthorKey" : "Ultralytics",
+  "MLModelLicenseKey" : "AGPL-3.0 License (https:\/\/ultralytics.com\/license)"
+}
