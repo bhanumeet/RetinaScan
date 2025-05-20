@@ -1,7 +1,3 @@
-//
-//  ContentView.swift
-//
-
 import SwiftUI
 import AVFoundation
 import Photos
@@ -10,6 +6,8 @@ import CoreMedia
 import UIKit
 import CoreML
 import Vision
+import AVKit
+import ImageIO
 
 // MARK: – ContentView
 
@@ -17,7 +15,6 @@ struct ContentView: View {
     @StateObject private var cameraService = CameraService()
     @State private var showImagesView = false
     @State private var zoomLevel: Float = 1.0
-    @State private var showFormatSheet = false
 
     var body: some View {
         ZStack {
@@ -26,45 +23,25 @@ struct ContentView: View {
                         cameraService: cameraService)
                 .ignoresSafeArea()
 
-            // Top controls: focus-lock, format, auto-zoom
+            // Top controls: focus-lock, auto-zoom
             VStack {
                 HStack {
                     // Focus-lock
-                    Button(action: { cameraService.toggleFocusLock() }) {
-                        Image(systemName: cameraService.isFocusLocked ? "lock.fill" : "lock.open")
+                    Button(action: cameraService.toggleFocusLock) {
+                        Image(systemName: cameraService.isFocusLocked
+                              ? "lock.fill" : "lock.open")
                             .font(.title2)
                             .foregroundColor(.white)
                             .padding(10)
                             .background(Color.black.opacity(0.5))
                             .clipShape(Circle())
-                    }
-
-                    // Format picker
-                    Button(action: { showFormatSheet = true }) {
-                        Image(systemName: "gearshape")
-                            .font(.title2)
-                            .foregroundColor(.white)
-                            .padding(10)
-                            .background(Color.black.opacity(0.5))
-                            .clipShape(Circle())
-                    }
-                    .actionSheet(isPresented: $showFormatSheet) {
-                        ActionSheet(
-                            title: Text("Choose Format"),
-                            buttons: cameraService.availableFormats.map { fmt in
-                                .default(Text(fmt.description)) {
-                                    cameraService.updateFormat(fmt)
-                                }
-                            } + [.cancel()]
-                        )
                     }
                     .padding(.leading, 8)
 
                     // Auto-Zoom toggle
-                    Button(action: { cameraService.toggleAutoZoom() }) {
+                    Button(action: cameraService.toggleAutoZoom) {
                         Image(systemName: cameraService.isAutoZoomEnabled
-                              ? "face.smiling.fill"
-                              : "face.smiling")
+                              ? "face.smiling.fill" : "face.smiling")
                             .font(.title2)
                             .foregroundColor(.white)
                             .padding(10)
@@ -92,10 +69,10 @@ struct ContentView: View {
                 .padding(.trailing, 16)
             }
 
-            // Record button (bottom)
+            // Capture Live Photo / Frame-capture button (bottom)
             VStack {
                 Spacer()
-                Button(action: { cameraService.startRecordingFrames() }) {
+                Button(action: cameraService.captureLivePhoto) {
                     Image("camera")
                         .resizable()
                         .aspectRatio(contentMode: .fit)
@@ -104,25 +81,33 @@ struct ContentView: View {
                 }
                 .buttonStyle(PlainButtonStyle())
                 .padding(.bottom, 30)
+                .simultaneousGesture(
+                    LongPressGesture(minimumDuration: 0.5)
+                        .onEnded { _ in
+                            cameraService.startRecordingFrames()
+                        }
+                )
             }
         }
         .onAppear {
             cameraService.configureSession()
             zoomLevel = cameraService.currentZoomFactor
-            cameraService.fetchFormats()
         }
-        .onReceive(NotificationCenter.default.publisher(for: CameraService.ZoomChangedNotification)) { notif in
+        .onReceive(NotificationCenter.default.publisher(
+                     for: CameraService.ZoomChangedNotification
+                  )) { notif in
             if let z = notif.object as? Float {
                 zoomLevel = z
             }
         }
         .onChange(of: cameraService.capturedImages.count) { newCount in
-            if newCount == CameraService.targetFrameCount {
+            if newCount > 0 {
                 showImagesView = true
             }
         }
         .sheet(isPresented: $showImagesView) {
-            ImagesView(images: cameraService.capturedImages) {
+            ImagesView(images: cameraService.capturedImages,
+                     metadata: cameraService.capturedMetadata) {
                 showImagesView = false
             }
         }
@@ -249,32 +234,25 @@ class PreviewUIView: UIView {
     }
 }
 
-// MARK: – AVCaptureDevice.Format helper
-
-private extension AVCaptureDevice.Format {
-    open override var description: String {
-        let dims = CMVideoFormatDescriptionGetDimensions(formatDescription)
-        let maxFps = videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
-        return "\(dims.width)x\(dims.height) @ \(Int(maxFps))fps"
-    }
-}
-
-// MARK: – CameraService with Auto-Zoom toggle & slider sync
+// MARK: – CameraService
 
 final class CameraService: NSObject, ObservableObject {
+    static let ZoomChangedNotification = Notification.Name("CameraServiceZoomChanged")
     static let targetFrameCount = 20
 
-    static let ZoomChangedNotification = Notification.Name("CameraServiceZoomChanged")
+    @Published var capturedImages: [UIImage] = []
+    @Published var capturedMetadata: [CFDictionary] = []
+    @Published var isFocusLocked = false
+    @Published var isAutoZoomEnabled = false
 
     let session = AVCaptureSession()
+    private let photoOutput = AVCapturePhotoOutput()
     private let videoOutput = AVCaptureVideoDataOutput()
+    private var detectionRequest: VNCoreMLRequest!
+    private let visionQueue = DispatchQueue(label: "visionQueue")
+
     private var frameCount = 0
     private var isRecording = false
-
-    @Published var capturedImages: [UIImage] = []
-    @Published var isFocusLocked = false
-    @Published var availableFormats: [AVCaptureDevice.Format] = []
-    @Published var isAutoZoomEnabled = false
 
     var minZoom: Float { 1.0 }
     var maxZoom: Float {
@@ -285,13 +263,21 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     private var currentDevice: AVCaptureDevice? {
-        AVCaptureDevice.default(.builtInWideAngleCamera,
-                                for: .video,
-                                position: .back)
+        let types: [AVCaptureDevice.DeviceType] = [
+            .builtInTripleCamera, .builtInDualWideCamera,
+            .builtInDualCamera, .builtInTelephotoCamera,
+            .builtInUltraWideCamera, .builtInWideAngleCamera
+        ]
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: types,
+            mediaType: .video,
+            position: .back
+        )
+        return discovery.devices.max { a, b in
+            CMVideoFormatDescriptionGetDimensions(a.activeFormat.formatDescription).width
+                < CMVideoFormatDescriptionGetDimensions(b.activeFormat.formatDescription).width
+        }
     }
-
-    private let visionQueue = DispatchQueue(label: "visionQueue")
-    private var detectionRequest: VNCoreMLRequest!
 
     override init() {
         super.init()
@@ -299,206 +285,39 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     private func configureVision() {
-        guard let modelURL = Bundle.main.url(
+        guard let url = Bundle.main.url(
                 forResource: "yolov8s-face-lindevs",
                 withExtension: "mlmodelc"
               ),
-              let coreMLModel = try? MLModel(contentsOf: modelURL),
-              let visionModel = try? VNCoreMLModel(for: coreMLModel)
-        else {
-            fatalError("Could not load CoreML model")
-        }
-
-        detectionRequest = VNCoreMLRequest(
-            model: visionModel,
-            completionHandler: handleDetections
-        )
+              let model = try? MLModel(contentsOf: url),
+              let vmodel = try? VNCoreMLModel(for: model)
+        else { return }
+        detectionRequest = VNCoreMLRequest(model: vmodel,
+                                           completionHandler: handleDetections)
         detectionRequest.imageCropAndScaleOption = .scaleFill
     }
 
     private func handleDetections(request: VNRequest, error: Error?) {
-        guard isAutoZoomEnabled else { return }
+        guard isAutoZoomEnabled,
+              error == nil,
+              let results = request.results as? [VNRecognizedObjectObservation],
+              let best = results.first(where: { $0.labels.first?.identifier == "face" })
+        else { DispatchQueue.main.async { self.isAutoZoomEnabled = false }; return }
 
-        if let _ = error {
-            DispatchQueue.main.async {
-                self.isAutoZoomEnabled = false
-                print("No face detected")
-            }
-            return
-        }
-        guard let results = request.results as? [VNRecognizedObjectObservation] else {
-            DispatchQueue.main.async {
-                self.isAutoZoomEnabled = false
-                print("No face detected")
-            }
-            return
-        }
-        let faces = results.filter { obs in
-            obs.labels.first?.identifier == "face"
-        }
-        guard let best = faces.max(by: { $0.confidence < $1.confidence }) else {
-            DispatchQueue.main.async {
-                self.isAutoZoomEnabled = false
-                print("No face detected")
-            }
-            return
-        }
         DispatchQueue.main.async {
-            self.performAutoZoom(boundingBox: best.boundingBox)
+            let rect = best.boundingBox
+            let target = min(
+                max(Float(max(1/rect.width, 1/rect.height) * 0.5), self.minZoom),
+                self.maxZoom
+            )
+            self.setZoomFactor(CGFloat(target))
+            self.isAutoZoomEnabled = false
         }
     }
 
     func toggleAutoZoom() {
-        DispatchQueue.main.async {
-            self.isAutoZoomEnabled.toggle()
-            print("Auto zoom \(self.isAutoZoomEnabled ? "enabled" : "disabled")")
-        }
+        DispatchQueue.main.async { self.isAutoZoomEnabled.toggle() }
     }
-
-    private func performAutoZoom(boundingBox rect: CGRect) {
-        // Zoom until the face box touches edges, then pull back to 75%
-        let zoom = min(
-            max(Float(max(1/rect.width, 1/rect.height) * 0.50), minZoom),
-            maxZoom
-        )
-        setZoomFactor(CGFloat(zoom))
-        isAutoZoomEnabled = false
-    }
-
-
-    func setZoomFactor(_ factor: CGFloat) {
-        guard let device = currentDevice else { return }
-        do {
-            try device.lockForConfiguration()
-            let clamped = min(max(factor, 1.0),
-                              device.activeFormat.videoMaxZoomFactor)
-            device.videoZoomFactor = clamped
-            device.unlockForConfiguration()
-            // Notify slider to move
-            NotificationCenter.default.post(
-                name: CameraService.ZoomChangedNotification,
-                object: clamped
-            )
-        } catch {
-            print("Zoom error: \(error)")
-        }
-    }
-
-    // MARK: – Format handling
-
-    func fetchFormats() {
-        guard let device = currentDevice else { return }
-        let sorted = device.formats.sorted {
-            let d1 = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
-            let d2 = CMVideoFormatDescriptionGetDimensions($1.formatDescription)
-            if d1.width != d2.width { return d1.width > d2.width }
-            let fps1 = $0.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
-            let fps2 = $1.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
-            return fps1 > fps2
-        }
-        var seen = Set<String>()
-        availableFormats = sorted.filter {
-            let desc = $0.description
-            if seen.contains(desc) { return false }
-            seen.insert(desc)
-            return true
-        }
-    }
-
-    func updateFormat(_ format: AVCaptureDevice.Format) {
-        guard let device = currentDevice else { return }
-        session.beginConfiguration()
-        do {
-            try device.lockForConfiguration()
-            device.activeFormat = format
-            if let bestRange = format.videoSupportedFrameRateRanges.max(
-                by: { $0.maxFrameRate < $1.maxFrameRate }
-            ) {
-                let fps = bestRange.maxFrameRate
-                let d = CMTime(value: 1, timescale: CMTimeScale(fps))
-                device.activeVideoMinFrameDuration = d
-                device.activeVideoMaxFrameDuration = d
-            }
-            device.unlockForConfiguration()
-        } catch {
-            print("Format error: \(error)")
-        }
-        session.commitConfiguration()
-    }
-
-    // MARK: – Session setup
-
-    func configureSession() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { granted in
-                if granted { self.setupSession() }
-            }
-        case .authorized:
-            setupSession()
-        default:
-            break
-        }
-        PHPhotoLibrary.requestAuthorization { _ in }
-    }
-
-    private func setupSession() {
-        guard let device = currentDevice else { return }
-        session.beginConfiguration()
-
-        if let fmt = select4K60Format(for: device) {
-            do {
-                try device.lockForConfiguration()
-                device.activeFormat = fmt
-                let t = CMTime(value: 1, timescale: 60)
-                device.activeVideoMinFrameDuration = t
-                device.activeVideoMaxFrameDuration = t
-                device.unlockForConfiguration()
-            } catch { }
-        }
-
-        if let input = try? AVCaptureDeviceInput(device: device),
-           session.canAddInput(input) {
-            session.addInput(input)
-        }
-        if session.canAddOutput(videoOutput) {
-            videoOutput.setSampleBufferDelegate(
-                self,
-                queue: DispatchQueue(label: "videoQueue")
-            )
-            session.addOutput(videoOutput)
-        }
-
-        session.commitConfiguration()
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.session.startRunning()
-        }
-    }
-
-    private func select4K60Format(
-        for device: AVCaptureDevice
-    ) -> AVCaptureDevice.Format? {
-        device.formats.first { f in
-            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-            return d.width == 3840 && d.height == 2160
-                && f.videoSupportedFrameRateRanges.contains {
-                    $0.maxFrameRate >= 60
-                }
-        }
-    }
-
-    // MARK: – Frame recording
-
-    func startRecordingFrames() {
-        DispatchQueue.main.async {
-            self.frameCount = 0
-            self.capturedImages = []
-            self.isRecording = true
-            self.toggleTorch(on: false)
-        }
-    }
-
-    // MARK: – Zoom, focus, torch, image conversion
 
     func focus(at point: CGPoint) {
         guard let device = currentDevice,
@@ -531,65 +350,217 @@ final class CameraService: NSObject, ObservableObject {
         } catch { }
     }
 
+    func setZoomFactor(_ factor: CGFloat) {
+        guard let device = currentDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            device.videoZoomFactor = min(max(factor, 1.0),
+                                         device.activeFormat.videoMaxZoomFactor)
+            device.unlockForConfiguration()
+            NotificationCenter.default.post(
+                name: CameraService.ZoomChangedNotification,
+                object: Float(device.videoZoomFactor)
+            )
+        } catch { }
+    }
+
+    func captureLivePhoto() {
+        guard photoOutput.isLivePhotoCaptureSupported else {
+            startRecordingFrames()
+            return
+        }
+        capturedImages.removeAll()
+        capturedMetadata.removeAll()
+
+        let settings: AVCapturePhotoSettings
+        if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+            settings = AVCapturePhotoSettings(
+                format: [AVVideoCodecKey: AVVideoCodecType.hevc]
+            )
+        } else {
+            settings = AVCapturePhotoSettings()
+        }
+        settings.isHighResolutionPhotoEnabled = true
+        settings.flashMode = .off
+        let movieURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("live.mov")
+        settings.livePhotoMovieFileURL = movieURL
+
+        DispatchQueue.main.asyncAfter(deadline: .now()) { self.toggleTorch(on: true) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.toggleTorch(on: false) }
+
+        photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+
+    func configureSession() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                if granted { self.setupSession() }
+            }
+        case .authorized:
+            setupSession()
+        default:
+            break
+        }
+        PHPhotoLibrary.requestAuthorization { _ in }
+    }
+
+    private func setupSession() {
+        guard let device = currentDevice else { return }
+        session.beginConfiguration()
+
+        // Use 4K video for ~8MP frames
+        if session.canSetSessionPreset(.hd4K3840x2160) {
+            session.sessionPreset = .hd4K3840x2160
+        } else {
+            session.sessionPreset = .high
+        }
+
+        // Photo output
+        if session.canAddOutput(photoOutput) {
+            session.addOutput(photoOutput)
+            photoOutput.isHighResolutionCaptureEnabled = true
+            photoOutput.isLivePhotoCaptureEnabled =
+                photoOutput.isLivePhotoCaptureSupported
+        }
+
+        // Video output (for frame capture at 4K)
+        if session.canAddOutput(videoOutput) {
+            videoOutput.alwaysDiscardsLateVideoFrames = true
+            videoOutput.setSampleBufferDelegate(self, queue: visionQueue)
+            session.addOutput(videoOutput)
+            videoOutput.connection(with: .video)?
+                .videoOrientation = .portrait
+        }
+
+        // Camera input
+        if let input = try? AVCaptureDeviceInput(device: device),
+           session.canAddInput(input) {
+            session.addInput(input)
+        }
+
+        session.commitConfiguration()
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.session.startRunning()
+        }
+    }
+
+    func startRecordingFrames() {
+        DispatchQueue.main.async {
+            self.frameCount = 0
+            self.capturedImages = []
+            self.capturedMetadata = []
+            self.isRecording = true
+            self.toggleTorch(on: false)
+        }
+    }
+
+    private func imageFromSampleBuffer(_ sampleBuffer: CMSampleBuffer) -> (UIImage, CFDictionary)? {
+        guard let pix = CMSampleBufferGetImageBuffer(sampleBuffer),
+              let metadata = CMCopyDictionaryOfAttachments(
+                allocator: nil,
+                target: sampleBuffer,
+                attachmentMode: kCMAttachmentMode_ShouldPropagate
+              ) else { return nil }
+        
+        let ci = CIImage(cvPixelBuffer: pix)
+        let ctx = CIContext()
+        guard let cg = ctx.createCGImage(ci, from: ci.extent) else { return nil }
+        
+        // Create UIImage with proper orientation
+        let image = UIImage(cgImage: cg, scale: 1.0, orientation: .right)
+        
+        return (image, metadata)
+    }
+
     private func toggleTorch(on: Bool) {
         guard let device = currentDevice, device.hasTorch else { return }
         do {
             try device.lockForConfiguration()
             device.torchMode = on ? .on : .off
             device.unlockForConfiguration()
-        } catch {
-            print("Torch error: \(error)")
-        }
-    }
-
-    private func imageFromSampleBuffer(
-        _ sampleBuffer: CMSampleBuffer
-    ) -> UIImage? {
-        guard let pix = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            return nil
-        }
-        let ci = CIImage(cvPixelBuffer: pix)
-        let ctx = CIContext()
-        guard let cg = ctx.createCGImage(ci, from: ci.extent) else {
-            return nil
-        }
-        return UIImage(
-            cgImage: cg,
-            scale: UIScreen.main.scale,
-            orientation: .right
-        )
+        } catch { }
     }
 }
 
+// MARK: – AVCapturePhotoCaptureDelegate
+
+extension CameraService: AVCapturePhotoCaptureDelegate {
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishProcessingPhoto photo: AVCapturePhoto,
+                     error: Error?) {
+        guard error == nil else { return }
+        
+        if let metadata = photo.metadata as CFDictionary? {
+            capturedMetadata.append(metadata)
+        }
+    }
+    
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishProcessingLivePhotoToMovieFileAt outputFileURL: URL,
+                     duration: CMTime,
+                     photoDisplayTime: CMTime,
+                     resolvedSettings: AVCaptureResolvedPhotoSettings,
+                     error: Error?) {
+        defer { try? FileManager.default.removeItem(at: outputFileURL) }
+
+        let asset = AVAsset(url: outputFileURL)
+        guard let track = asset.tracks(withMediaType: .video).first,
+              let reader = try? AVAssetReader(asset: asset) else { return }
+
+        let opts: [String:Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String:
+              kCVPixelFormatType_32BGRA
+        ]
+        let assetOutput = AVAssetReaderTrackOutput(
+            track: track, outputSettings: opts
+        )
+        reader.add(assetOutput)
+        reader.startReading()
+
+        var imgs: [(UIImage, CFDictionary)] = []
+        while let sample = assetOutput.copyNextSampleBuffer(),
+              let result = imageFromSampleBuffer(sample) {
+            imgs.append(result)
+        }
+        DispatchQueue.main.async {
+            self.capturedImages = imgs.map { $0.0 }
+            self.capturedMetadata = imgs.map { $0.1 }
+        }
+    }
+}
+
+// MARK: – AVCaptureVideoDataOutputSampleBufferDelegate
+
 extension CameraService: AVCaptureVideoDataOutputSampleBufferDelegate {
+    
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-        // Vision pass
         if let pix = CMSampleBufferGetImageBuffer(sampleBuffer) {
-            visionQueue.async {
-                _ = try? VNImageRequestHandler(
-                    cvPixelBuffer: pix,
-                    orientation: .right,
-                    options: [:]
-                ).perform([self.detectionRequest])
-            }
+            try? VNImageRequestHandler(
+                cvPixelBuffer: pix,
+                orientation: .right,
+                options: [:]
+            ).perform([detectionRequest])
         }
 
-        // Frame-capture logic
         guard isRecording else { return }
         frameCount += 1
-        if frameCount == CameraService.targetFrameCount {
+
+        if frameCount == CameraService.targetFrameCount/2 {
+            toggleTorch(on: true)
+        } else if frameCount >= CameraService.targetFrameCount {
             toggleTorch(on: false)
             isRecording = false
-        } else if frameCount == 11 {
-            toggleTorch(on: true)
         }
 
         if frameCount <= CameraService.targetFrameCount,
-           let img = imageFromSampleBuffer(sampleBuffer) {
+           let result = imageFromSampleBuffer(sampleBuffer) {
             DispatchQueue.main.async {
-                self.capturedImages.append(img)
+                self.capturedImages.append(result.0)
+                self.capturedMetadata.append(result.1)
             }
         }
     }
