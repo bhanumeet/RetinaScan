@@ -1,3 +1,5 @@
+// ImagesView.swift
+
 import SwiftUI
 import Photos
 import UIKit
@@ -6,20 +8,22 @@ import UniformTypeIdentifiers
 
 // MARK: – UIImage orientation fix
 extension UIImage {
-    /// Returns a copy of the image with its orientation normalized to .up
+    /// Normalize orientation
     func fixedOrientation() -> UIImage {
         guard imageOrientation != .up else { return self }
         UIGraphicsBeginImageContextWithOptions(size, false, scale)
         draw(in: CGRect(origin: .zero, size: size))
-        let normalizedImage = UIGraphicsGetImageFromCurrentImageContext()!
+        let normalized = UIGraphicsGetImageFromCurrentImageContext()!
         UIGraphicsEndImageContext()
-        return normalizedImage
+        return normalized
     }
 }
 
 struct ImagesView: View {
     let images: [UIImage]
     let metadata: [CFDictionary]
+    let userISO: Float
+    let userExposureDuration: Double
     let onDone: () -> Void
 
     @State private var prefix: String = ""
@@ -36,7 +40,6 @@ struct ImagesView: View {
         ZStack {
             NavigationView {
                 VStack(spacing: 0) {
-                    // ─── Text Input for Filename Prefix ─────────────────────────
                     HStack {
                         TextField("Filename prefix", text: $prefix)
                             .textFieldStyle(RoundedBorderTextFieldStyle())
@@ -45,18 +48,16 @@ struct ImagesView: View {
                     }
                     .padding(.vertical, 8)
 
-                    // ─── Grid of Thumbnails ────────────────────────────────────
                     ScrollView {
                         LazyVGrid(columns: columns, spacing: 8) {
                             ForEach(images.indices, id: \.self) { idx in
-                                let img = images[idx]
-                                Image(uiImage: img)
+                                Image(uiImage: images[idx])
                                     .resizable()
                                     .aspectRatio(contentMode: .fill)
                                     .frame(height: 100)
                                     .clipped()
                                     .onTapGesture {
-                                        saveToGallery(img, metadata: metadata[idx])
+                                        saveToGallery(images[idx], metadata: metadata[idx])
                                     }
                                     .onLongPressGesture(
                                         minimumDuration: 1.0,
@@ -81,15 +82,13 @@ struct ImagesView: View {
                         VStack {
                             Text("Select Frames")
                                 .font(.headline)
-                            Text("Hold an image to enlarge")
+                            Text("Hold to enlarge")
                                 .font(.subheadline)
                                 .foregroundColor(.gray)
                         }
                     }
                     ToolbarItem(placement: .navigationBarTrailing) {
-                        Button("Done") {
-                            onDone()
-                        }
+                        Button("Done") { onDone() }
                     }
                 }
                 .alert(alertMessage, isPresented: $showAlert) {
@@ -97,17 +96,13 @@ struct ImagesView: View {
                 }
             }
 
-            // ─── Enlarged Image Overlay ────────────────────────────────
             if let idx = pressedIndex {
-                Color.black.opacity(0.8)
-                    .ignoresSafeArea()
+                Color.black.opacity(0.8).ignoresSafeArea()
                 Image(uiImage: images[idx])
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .padding(20)
-                    .onTapGesture {
-                        pressedIndex = nil
-                    }
+                    .onTapGesture { pressedIndex = nil }
             }
         }
     }
@@ -122,9 +117,8 @@ struct ImagesView: View {
                 return
             }
 
-            // ─── Normalize orientation ───────────────────────────────
-            let normalizedImage = image.fixedOrientation()
-            guard let cgImage = normalizedImage.cgImage else {
+            let norm = image.fixedOrientation()
+            guard let cgImage = norm.cgImage else {
                 DispatchQueue.main.async {
                     alertMessage = "Failed to get CGImage."
                     showAlert = true
@@ -132,14 +126,19 @@ struct ImagesView: View {
                 return
             }
 
-            // ─── Prepare metadata ────────────────────────────────────
-            let mutableMetadata = NSMutableDictionary(dictionary: metadata)
-            mutableMetadata[kCGImagePropertyOrientation as String] = 1
+            // Merge metadata & override Exif
+            let mmd = NSMutableDictionary(dictionary: metadata)
+            mmd[kCGImagePropertyOrientation as String] = 1
 
-            // ─── Create JPEG data ────────────────────────────────────
-            let destData = NSMutableData()
-            guard let destination = CGImageDestinationCreateWithData(
-                destData as CFMutableData,
+            let exifKey = kCGImagePropertyExifDictionary as String
+            var exif = (mmd[exifKey] as? NSMutableDictionary) ?? NSMutableDictionary()
+            exif[kCGImagePropertyExifExposureTime as String] = userExposureDuration
+            exif[kCGImagePropertyExifISOSpeedRatings as String] = [Int(userISO)]
+            mmd[exifKey] = exif
+
+            let data = NSMutableData()
+            guard let dest = CGImageDestinationCreateWithData(
+                data as CFMutableData,
                 UTType.jpeg.identifier as CFString,
                 1,
                 nil
@@ -150,12 +149,9 @@ struct ImagesView: View {
                 }
                 return
             }
-            CGImageDestinationAddImage(
-                destination,
-                cgImage,
-                mutableMetadata as CFDictionary
-            )
-            guard CGImageDestinationFinalize(destination) else {
+
+            CGImageDestinationAddImage(dest, cgImage, mmd as CFDictionary)
+            guard CGImageDestinationFinalize(dest) else {
                 DispatchQueue.main.async {
                     alertMessage = "Failed to finalize image."
                     showAlert = true
@@ -163,36 +159,24 @@ struct ImagesView: View {
                 return
             }
 
-            // ─── Use prefix for filename ─────────────────────────────
-            let timestamp = Int(Date().timeIntervalSince1970)
-            let filename: String
-            if prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                filename = "IMG_\(timestamp).jpg"
-            } else {
-                // sanitize prefix: remove spaces/newlines
-                let safePrefix = prefix
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .replacingOccurrences(of: " ", with: "_")
-                filename = "\(safePrefix)_\(timestamp).jpg"
-            }
+            let ts = Int(Date().timeIntervalSince1970)
+            let name = prefix
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: " ", with: "_")
+            let filename = name.isEmpty ? "IMG_\(ts).jpg" : "\(name)_\(ts).jpg"
 
-            let creationOptions = PHAssetResourceCreationOptions()
-            creationOptions.originalFilename = filename
+            let opts = PHAssetResourceCreationOptions()
+            opts.originalFilename = filename
 
-            // ─── Save to Photo Library ───────────────────────────────
             PHPhotoLibrary.shared().performChanges({
-                let creationRequest = PHAssetCreationRequest.forAsset()
-                creationRequest.addResource(
-                    with: .photo,
-                    data: destData as Data,
-                    options: creationOptions
-                )
+                let req = PHAssetCreationRequest.forAsset()
+                req.addResource(with: .photo, data: data as Data, options: opts)
             }) { success, error in
                 DispatchQueue.main.async {
-                    if let error = error {
-                        alertMessage = "⚠️ Save error: \(error.localizedDescription)"
+                    if let err = error {
+                        alertMessage = "⚠️ Save error: \(err.localizedDescription)"
                     } else {
-                        alertMessage = "✅ Saved “\(filename)” successfully."
+                        alertMessage = "✅ Saved “\(filename)”"
                     }
                     showAlert = true
                 }

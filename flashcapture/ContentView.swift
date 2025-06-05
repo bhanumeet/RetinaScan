@@ -1,3 +1,5 @@
+// ContentView.swift
+
 import SwiftUI
 import AVFoundation
 import Photos
@@ -8,28 +10,85 @@ import CoreML
 import Vision
 import AVKit
 import ImageIO
+import MediaPlayer  // Added to handle volume button
 
-// MARK: – ContentView
+// MARK: - Volume Button Handling
+
+/// Observes volume button presses by KVO on AVAudioSession's outputVolume.
+/// Triggers `onVolumeUp` when volume increases.
+class VolumeObserver: NSObject {
+    private var audioSession: AVAudioSession
+    private var initialVolume: Float
+    private let onVolumeUp: () -> Void
+
+    init(onVolumeUp: @escaping () -> Void) {
+        self.onVolumeUp = onVolumeUp
+        self.audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setActive(true)
+        } catch {
+            print("Failed to activate audio session: \(error)")
+        }
+        self.initialVolume = audioSession.outputVolume
+        super.init()
+        audioSession.addObserver(self, forKeyPath: "outputVolume", options: [.new], context: nil)
+    }
+
+    override func observeValue(
+        forKeyPath keyPath: String?,
+        of object: Any?,
+        change: [NSKeyValueChangeKey : Any]?,
+        context: UnsafeMutableRawPointer?
+    ) {
+        guard keyPath == "outputVolume",
+              let newVol = (change?[.newKey] as? NSNumber)?.floatValue else {
+            return
+        }
+        // If new volume is greater than previous, treat as volume-up press.
+        if newVol > initialVolume {
+            onVolumeUp()
+        }
+        initialVolume = newVol
+    }
+
+    deinit {
+        audioSession.removeObserver(self, forKeyPath: "outputVolume")
+    }
+}
+
+/// A hidden MPVolumeView so that the hardware volume HUD does not appear
+/// when the user presses the volume buttons.
+struct VolumeView: UIViewRepresentable {
+    func makeUIView(context: Context) -> MPVolumeView {
+        let view = MPVolumeView(frame: .zero)
+        view.isHidden = true
+        return view
+    }
+
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {}
+}
+
+// MARK: - ContentView
 
 struct ContentView: View {
     @StateObject private var cameraService = CameraService()
     @State private var showImagesView = false
     @State private var zoomLevel: Float = 1.0
+    @State private var showSettings = false
+    @State private var volumeObserver: VolumeObserver? = nil
 
     var body: some View {
         ZStack {
-            // Live preview
+            // Live camera preview
             PreviewView(session: cameraService.session,
                         cameraService: cameraService)
                 .ignoresSafeArea()
 
-            // Top controls: focus-lock, auto-zoom
+            // Top controls: focus, auto-zoom, settings
             VStack {
                 HStack {
-                    // Focus-lock
                     Button(action: cameraService.toggleFocusLock) {
-                        Image(systemName: cameraService.isFocusLocked
-                              ? "lock.fill" : "lock.open")
+                        Image(systemName: cameraService.isFocusLocked ? "lock.fill" : "lock.open")
                             .font(.title2)
                             .foregroundColor(.white)
                             .padding(10)
@@ -38,10 +97,18 @@ struct ContentView: View {
                     }
                     .padding(.leading, 8)
 
-                    // Auto-Zoom toggle
                     Button(action: cameraService.toggleAutoZoom) {
-                        Image(systemName: cameraService.isAutoZoomEnabled
-                              ? "face.smiling.fill" : "face.smiling")
+                        Image(systemName: cameraService.isAutoZoomEnabled ? "face.smiling.fill" : "face.smiling")
+                            .font(.title2)
+                            .foregroundColor(.white)
+                            .padding(10)
+                            .background(Color.black.opacity(0.5))
+                            .clipShape(Circle())
+                    }
+                    .padding(.leading, 8)
+
+                    Button(action: { showSettings = true }) {
+                        Image(systemName: "gearshape")
                             .font(.title2)
                             .foregroundColor(.white)
                             .padding(10)
@@ -57,7 +124,7 @@ struct ContentView: View {
             .padding(.top, 16)
             .padding(.horizontal, 16)
 
-            // Zoom slider (right)
+            // Zoom slider on the right
             HStack {
                 Spacer()
                 ZoomControl(zoomLevel: $zoomLevel,
@@ -69,10 +136,13 @@ struct ContentView: View {
                 .padding(.trailing, 16)
             }
 
-            // Capture Live Photo / Frame-capture button (bottom)
+            // Capture / Live Photo button at the bottom
             VStack {
                 Spacer()
-                Button(action: cameraService.captureLivePhoto) {
+                Button(action: {
+                    cameraService.configureExposure()
+                    cameraService.captureLivePhoto()
+                }) {
                     Image("camera")
                         .resizable()
                         .aspectRatio(contentMode: .fit)
@@ -88,14 +158,23 @@ struct ContentView: View {
                         }
                 )
             }
+
+            // Hidden volume view so system volume HUD stays hidden
+            VolumeView()
         }
         .onAppear {
             cameraService.configureSession()
             zoomLevel = cameraService.currentZoomFactor
+
+            // Initialize the volume observer to trigger camera capture on volume-up
+            volumeObserver = VolumeObserver {
+                cameraService.configureExposure()
+                cameraService.captureLivePhoto()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(
-                     for: CameraService.ZoomChangedNotification
-                  )) { notif in
+            for: CameraService.ZoomChangedNotification
+        )) { notif in
             if let z = notif.object as? Float {
                 zoomLevel = z
             }
@@ -106,15 +185,70 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showImagesView) {
-            ImagesView(images: cameraService.capturedImages,
-                     metadata: cameraService.capturedMetadata) {
+            ImagesView(
+                images: cameraService.capturedImages,
+                metadata: cameraService.capturedMetadata,
+                userISO: cameraService.userISO,
+                userExposureDuration: cameraService.userExposureDuration
+            ) {
                 showImagesView = false
+            }
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsView(cameraService: cameraService)
+        }
+        .onChange(of: showSettings) { shown in
+            if !shown {
+                cameraService.configureExposure()
             }
         }
     }
 }
 
-// MARK: – ZoomControl
+// MARK: - SettingsView
+
+struct SettingsView: View {
+    @ObservedObject var cameraService: CameraService
+    @Environment(\.presentationMode) var presentationMode
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("Exposure Duration (s)")) {
+                    Slider(
+                        value: $cameraService.userExposureDuration,
+                        in: 0.05...0.30,
+                        step: 0.05
+                    ) {
+                        Text("Duration")
+                    }
+                    Text(String(format: "%.4f s", cameraService.userExposureDuration))
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                }
+
+                Section(header: Text("ISO")) {
+                    Slider(
+                        value: $cameraService.userISO,
+                        in: cameraService.minISO...cameraService.maxISO,
+                        step: 1
+                    ) {
+                        Text("ISO")
+                    }
+                    Text("\(Int(cameraService.userISO))")
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                }
+            }
+            .navigationBarTitle("Camera Settings", displayMode: .inline)
+            .navigationBarItems(trailing: Button("Done") {
+                presentationMode.wrappedValue.dismiss()
+            })
+        }
+    }
+}
+
+// MARK: - ZoomControl
 
 struct ZoomControl: UIViewRepresentable {
     @Binding var zoomLevel: Float
@@ -158,6 +292,7 @@ struct ZoomControl: UIViewRepresentable {
             slider.widthAnchor.constraint(equalTo: bar.heightAnchor),
             slider.heightAnchor.constraint(equalToConstant: 22),
         ])
+
         slider.transform = CGAffineTransform(rotationAngle: -CGFloat.pi / 2)
         return container
     }
@@ -179,7 +314,7 @@ struct ZoomControl: UIViewRepresentable {
     }
 }
 
-// MARK: – PreviewView
+// MARK: - PreviewView
 
 struct PreviewView: UIViewRepresentable {
     let session: AVCaptureSession
@@ -209,16 +344,13 @@ struct PreviewView: UIViewRepresentable {
 
     class PreviewCoordinator: NSObject {
         let cameraService: CameraService
-        init(cameraService: CameraService) {
-            self.cameraService = cameraService
-        }
+        init(cameraService: CameraService) { self.cameraService = cameraService }
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
             guard !cameraService.isFocusLocked,
                   let view = gesture.view else { return }
             let pt = gesture.location(in: view)
             let size = view.bounds.size
-            cameraService.focus(at: CGPoint(x: pt.x/size.width,
-                                            y: pt.y/size.height))
+            cameraService.focus(at: CGPoint(x: pt.x/size.width, y: pt.y/size.height))
         }
     }
 }
@@ -234,11 +366,14 @@ class PreviewUIView: UIView {
     }
 }
 
-// MARK: – CameraService
+// MARK: - CameraService
 
 final class CameraService: NSObject, ObservableObject {
     static let ZoomChangedNotification = Notification.Name("CameraServiceZoomChanged")
     static let targetFrameCount = 20
+
+    @Published var userExposureDuration: Double = 0.25
+    @Published var userISO: Float = 160.0
 
     @Published var capturedImages: [UIImage] = []
     @Published var capturedMetadata: [CFDictionary] = []
@@ -250,33 +385,22 @@ final class CameraService: NSObject, ObservableObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private var detectionRequest: VNCoreMLRequest!
     private let visionQueue = DispatchQueue(label: "visionQueue")
-
     private var frameCount = 0
     private var isRecording = false
 
     var minZoom: Float { 1.0 }
-    var maxZoom: Float {
-        Float(currentDevice?.activeFormat.videoMaxZoomFactor ?? 5.0)
-    }
-    var currentZoomFactor: Float {
-        Float(currentDevice?.videoZoomFactor ?? 1.0)
-    }
+    var maxZoom: Float { Float(currentDevice?.activeFormat.videoMaxZoomFactor ?? 5.0) }
+    var currentZoomFactor: Float { Float(currentDevice?.videoZoomFactor ?? 1.0) }
+
+    var minISO: Float { currentDevice?.activeFormat.minISO ?? 10.0 }
+    var maxISO: Float { currentDevice?.activeFormat.maxISO ?? 6400.0 }
 
     private var currentDevice: AVCaptureDevice? {
-        let types: [AVCaptureDevice.DeviceType] = [
-            .builtInTripleCamera, .builtInDualWideCamera,
-            .builtInDualCamera, .builtInTelephotoCamera,
-            .builtInUltraWideCamera, .builtInWideAngleCamera
-        ]
-        let discovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: types,
+        AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInTripleCamera, .builtInDualCamera, .builtInWideAngleCamera],
             mediaType: .video,
             position: .back
-        )
-        return discovery.devices.max { a, b in
-            CMVideoFormatDescriptionGetDimensions(a.activeFormat.formatDescription).width
-                < CMVideoFormatDescriptionGetDimensions(b.activeFormat.formatDescription).width
-        }
+        ).devices.first
     }
 
     override init() {
@@ -285,31 +409,24 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     private func configureVision() {
-        guard let url = Bundle.main.url(
-                forResource: "yolov8s-face-lindevs",
-                withExtension: "mlmodelc"
-              ),
-              let model = try? MLModel(contentsOf: url),
-              let vmodel = try? VNCoreMLModel(for: model)
-        else { return }
-        detectionRequest = VNCoreMLRequest(model: vmodel,
-                                           completionHandler: handleDetections)
+        guard let model = try? VNCoreMLModel(for: YOLOv8s_Face_Lindevs(configuration: .init()).model) else {
+            print("Failed to load CoreML model")
+            return
+        }
+        detectionRequest = VNCoreMLRequest(model: model, completionHandler: handleDetections)
         detectionRequest.imageCropAndScaleOption = .scaleFill
     }
 
     private func handleDetections(request: VNRequest, error: Error?) {
-        guard isAutoZoomEnabled,
-              error == nil,
+        guard isAutoZoomEnabled, error == nil,
               let results = request.results as? [VNRecognizedObjectObservation],
-              let best = results.first(where: { $0.labels.first?.identifier == "face" })
-        else { DispatchQueue.main.async { self.isAutoZoomEnabled = false }; return }
-
+              let best = results.first(where: { $0.labels.first?.identifier == "face" }) else {
+            DispatchQueue.main.async { self.isAutoZoomEnabled = false }
+            return
+        }
         DispatchQueue.main.async {
             let rect = best.boundingBox
-            let target = min(
-                max(Float(max(1/rect.width, 1/rect.height) * 0.5), self.minZoom),
-                self.maxZoom
-            )
+            let target = min(max(Float(max(1/rect.width, 1/rect.height) * 0.75), self.minZoom), self.maxZoom)
             self.setZoomFactor(CGFloat(target))
             self.isAutoZoomEnabled = false
         }
@@ -319,77 +436,31 @@ final class CameraService: NSObject, ObservableObject {
         DispatchQueue.main.async { self.isAutoZoomEnabled.toggle() }
     }
 
-    func focus(at point: CGPoint) {
-        guard let device = currentDevice,
-              device.isFocusPointOfInterestSupported else { return }
-        do {
-            try device.lockForConfiguration()
-            device.focusPointOfInterest = point
-            device.focusMode = .autoFocus
-            device.unlockForConfiguration()
-        } catch { }
-    }
-
-    func toggleFocusLock() {
+    func configureExposure() {
         guard let device = currentDevice else { return }
+        let desiredDur = CMTimeMakeWithSeconds(userExposureDuration, preferredTimescale: 1_000_000)
+        let desiredISO = userISO
         do {
             try device.lockForConfiguration()
-            if isFocusLocked {
-                if device.isFocusModeSupported(.continuousAutoFocus) {
-                    device.focusMode = .continuousAutoFocus
+            let minDur = device.activeFormat.minExposureDuration
+            let maxDur = device.activeFormat.maxExposureDuration
+            let clampedDur = min(max(desiredDur, minDur), maxDur)
+            let minISO = device.activeFormat.minISO
+            let maxISO = device.activeFormat.maxISO
+            let clampedISO = max(minISO, min(desiredISO, maxISO))
+            if device.isExposureModeSupported(.custom) {
+                device.setExposureModeCustom(duration: clampedDur, iso: clampedISO) { _ in
+                    print("🔧 Exposure: ISO \(clampedISO), \(clampedDur.seconds)s")
                 }
-                isFocusLocked = false
+            } else if device.isExposureModeSupported(.locked) {
+                device.exposureMode = .locked
             } else {
-                if device.isFocusPointOfInterestSupported {
-                    device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
-                    device.focusMode = .locked
-                }
-                isFocusLocked = true
+                device.exposureMode = .continuousAutoExposure
             }
             device.unlockForConfiguration()
-        } catch { }
-    }
-
-    func setZoomFactor(_ factor: CGFloat) {
-        guard let device = currentDevice else { return }
-        do {
-            try device.lockForConfiguration()
-            device.videoZoomFactor = min(max(factor, 1.0),
-                                         device.activeFormat.videoMaxZoomFactor)
-            device.unlockForConfiguration()
-            NotificationCenter.default.post(
-                name: CameraService.ZoomChangedNotification,
-                object: Float(device.videoZoomFactor)
-            )
-        } catch { }
-    }
-
-    func captureLivePhoto() {
-        guard photoOutput.isLivePhotoCaptureSupported else {
-            startRecordingFrames()
-            return
+        } catch {
+            print("❌ Exposure config failed: \(error)")
         }
-        capturedImages.removeAll()
-        capturedMetadata.removeAll()
-
-        let settings: AVCapturePhotoSettings
-        if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
-            settings = AVCapturePhotoSettings(
-                format: [AVVideoCodecKey: AVVideoCodecType.hevc]
-            )
-        } else {
-            settings = AVCapturePhotoSettings()
-        }
-        settings.isHighResolutionPhotoEnabled = true
-        settings.flashMode = .off
-        let movieURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("live.mov")
-        settings.livePhotoMovieFileURL = movieURL
-
-        DispatchQueue.main.asyncAfter(deadline: .now()) { self.toggleTorch(on: true) }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.toggleTorch(on: false) }
-
-        photoOutput.capturePhoto(with: settings, delegate: self)
     }
 
     func configureSession() {
@@ -401,46 +472,34 @@ final class CameraService: NSObject, ObservableObject {
         case .authorized:
             setupSession()
         default:
-            break
+            print("Camera access denied")
         }
-        PHPhotoLibrary.requestAuthorization { _ in }
     }
 
     private func setupSession() {
         guard let device = currentDevice else { return }
         session.beginConfiguration()
+        session.sessionPreset = .hd4K3840x2160
 
-        // Use 4K video for ~8MP frames
-        if session.canSetSessionPreset(.hd4K3840x2160) {
-            session.sessionPreset = .hd4K3840x2160
-        } else {
-            session.sessionPreset = .high
+        if let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) {
+            session.addInput(input)
         }
 
-        // Photo output
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
             photoOutput.isHighResolutionCaptureEnabled = true
-            photoOutput.isLivePhotoCaptureEnabled =
-                photoOutput.isLivePhotoCaptureSupported
+            photoOutput.isLivePhotoCaptureEnabled = photoOutput.isLivePhotoCaptureSupported
         }
 
-        // Video output (for frame capture at 4K)
         if session.canAddOutput(videoOutput) {
             videoOutput.alwaysDiscardsLateVideoFrames = true
             videoOutput.setSampleBufferDelegate(self, queue: visionQueue)
             session.addOutput(videoOutput)
-            videoOutput.connection(with: .video)?
-                .videoOrientation = .portrait
-        }
-
-        // Camera input
-        if let input = try? AVCaptureDeviceInput(device: device),
-           session.canAddInput(input) {
-            session.addInput(input)
         }
 
         session.commitConfiguration()
+        configureExposure()
+
         DispatchQueue.global(qos: .userInitiated).async {
             self.session.startRunning()
         }
@@ -456,6 +515,32 @@ final class CameraService: NSObject, ObservableObject {
         }
     }
 
+    func captureLivePhoto() {
+        guard photoOutput.isLivePhotoCaptureSupported else {
+            startRecordingFrames()
+            return
+        }
+        capturedImages.removeAll()
+        capturedMetadata.removeAll()
+
+        let settings: AVCapturePhotoSettings
+        if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+            settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
+        } else {
+            settings = AVCapturePhotoSettings()
+        }
+        settings.isHighResolutionPhotoEnabled = true
+        settings.flashMode = .off
+        let movieURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("live.mov")
+        settings.livePhotoMovieFileURL = movieURL
+
+        DispatchQueue.main.asyncAfter(deadline: .now()) { self.toggleTorch(on: true) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.toggleTorch(on: false) }
+
+        photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+
     private func imageFromSampleBuffer(_ sampleBuffer: CMSampleBuffer) -> (UIImage, CFDictionary)? {
         guard let pix = CMSampleBufferGetImageBuffer(sampleBuffer),
               let metadata = CMCopyDictionaryOfAttachments(
@@ -463,14 +548,10 @@ final class CameraService: NSObject, ObservableObject {
                 target: sampleBuffer,
                 attachmentMode: kCMAttachmentMode_ShouldPropagate
               ) else { return nil }
-        
         let ci = CIImage(cvPixelBuffer: pix)
         let ctx = CIContext()
         guard let cg = ctx.createCGImage(ci, from: ci.extent) else { return nil }
-        
-        // Create UIImage with proper orientation
         let image = UIImage(cgImage: cg, scale: 1.0, orientation: .right)
-        
         return (image, metadata)
     }
 
@@ -480,23 +561,71 @@ final class CameraService: NSObject, ObservableObject {
             try device.lockForConfiguration()
             device.torchMode = on ? .on : .off
             device.unlockForConfiguration()
-        } catch { }
+        } catch {
+            print("Torch failed: \(error)")
+        }
+    }
+
+    func focus(at point: CGPoint) {
+        guard let device = currentDevice, device.isFocusPointOfInterestSupported else { return }
+        do {
+            try device.lockForConfiguration()
+            device.focusPointOfInterest = point
+            device.focusMode = .autoFocus
+            device.unlockForConfiguration()
+        } catch {
+            print("Focus failed: \(error)")
+        }
+    }
+
+    func toggleFocusLock() {
+        guard let device = currentDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            if isFocusLocked {
+                device.focusMode = .continuousAutoFocus
+                device.exposureMode = .continuousAutoExposure
+                isFocusLocked = false
+            } else {
+                device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+                device.focusMode = .locked
+                configureExposure()
+                isFocusLocked = true
+            }
+            device.unlockForConfiguration()
+        } catch {
+            print("Focus/exposure lock failed: \(error)")
+        }
+    }
+
+    func setZoomFactor(_ factor: CGFloat) {
+        guard let device = currentDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            device.videoZoomFactor = min(max(factor, 1.0), device.activeFormat.videoMaxZoomFactor)
+            device.unlockForConfiguration()
+            NotificationCenter.default.post(
+                name: CameraService.ZoomChangedNotification,
+                object: Float(device.videoZoomFactor)
+            )
+        } catch {
+            print("Zoom failed: \(error)")
+        }
     }
 }
 
-// MARK: – AVCapturePhotoCaptureDelegate
+// MARK: - AVCapturePhotoCaptureDelegate
 
 extension CameraService: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
         guard error == nil else { return }
-        
         if let metadata = photo.metadata as CFDictionary? {
             capturedMetadata.append(metadata)
         }
     }
-    
+
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishProcessingLivePhotoToMovieFileAt outputFileURL: URL,
                      duration: CMTime,
@@ -504,18 +633,11 @@ extension CameraService: AVCapturePhotoCaptureDelegate {
                      resolvedSettings: AVCaptureResolvedPhotoSettings,
                      error: Error?) {
         defer { try? FileManager.default.removeItem(at: outputFileURL) }
-
         let asset = AVAsset(url: outputFileURL)
         guard let track = asset.tracks(withMediaType: .video).first,
               let reader = try? AVAssetReader(asset: asset) else { return }
-
-        let opts: [String:Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String:
-              kCVPixelFormatType_32BGRA
-        ]
-        let assetOutput = AVAssetReaderTrackOutput(
-            track: track, outputSettings: opts
-        )
+        let opts: [String:Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        let assetOutput = AVAssetReaderTrackOutput(track: track, outputSettings: opts)
         reader.add(assetOutput)
         reader.startReading()
 
@@ -531,10 +653,9 @@ extension CameraService: AVCapturePhotoCaptureDelegate {
     }
 }
 
-// MARK: – AVCaptureVideoDataOutputSampleBufferDelegate
+// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
 
 extension CameraService: AVCaptureVideoDataOutputSampleBufferDelegate {
-    
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
@@ -563,5 +684,22 @@ extension CameraService: AVCaptureVideoDataOutputSampleBufferDelegate {
                 self.capturedMetadata.append(result.1)
             }
         }
+    }
+}
+
+// MARK: - CoreML Model Loader
+
+class YOLOv8s_Face_Lindevs {
+    let model: MLModel
+
+    init(configuration: MLModelConfiguration) throws {
+        model = try MLModel(contentsOf: try Self.urlOfModelInThisBundle(), configuration: configuration)
+    }
+
+    static func urlOfModelInThisBundle() throws -> URL {
+        guard let url = Bundle.main.url(forResource: "yolov8s-face-lindevs", withExtension: "mlmodelc") else {
+            throw NSError(domain: "com.example", code: -1, userInfo: [NSLocalizedDescriptionKey: "Model file not found"])
+        }
+        return url
     }
 }
