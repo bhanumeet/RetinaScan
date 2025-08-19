@@ -28,7 +28,7 @@
 - **Real-time Focus Display:** Shows exact lens position (0.000-1.000 scale)
 - **Focus Distance Calculation:** Converts lens position to approximate distance in meters
 
-### 🤖 **AI-Powered Auto-Zoom (YOLOv8 Face Detection)**
+### Face Detection & Auto-Zoom (YOLOv8 Face Detection)**
 - Uses YOLOv8 face detection model (`yolov8s-face-lindevs.mlmodelc`)
 - Automatically detects and zooms to patient's face
 - Calculates optimal zoom level based on face bounding box
