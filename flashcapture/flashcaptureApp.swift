@@ -11,7 +11,7 @@ import SwiftUI
 struct flashcaptureApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            VideoView()
         }
     }
 }

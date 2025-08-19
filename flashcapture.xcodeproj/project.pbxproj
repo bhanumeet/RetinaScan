@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
+		209D97182DD7C19300F741A7 /* VideoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoView.swift; sourceTree = "<group>"; };
 		20D2A1AF2DCA874100EFA53D /* flashcapture.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = flashcapture.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -54,6 +55,7 @@
 			isa = PBXGroup;
 			children = (
 				20D2A1AF2DCA874100EFA53D /* flashcapture.app */,
+				209D97182DD7C19300F741A7 /* VideoView.swift */,
 			);
 			name = Products;
 			sourceTree = "<group>";
